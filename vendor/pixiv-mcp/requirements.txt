@@ -1,0 +1,4 @@
+pixivpy3>=3.7.4
+mcp>=1.2.0,<2
+requests>=2.31.0
+Pillow>=10.0.0
