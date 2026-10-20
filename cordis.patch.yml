@@ -1,0 +1,20 @@
+# ============================================================================
+# dsh-pixiv-scroll —— DSH bundle patch（插件自带的挂载声明）
+# ============================================================================
+# 标准 DSH 插件：包自己声明要往 profile 的配置树里插什么。
+# 装好后只要 profile 的 `dsh.profile.bundles` 列出本包名即生效：
+#
+#   dsh plugin --profile web add link:<本目录>
+#
+# ⚠️ entry id（下面这个 `pixiv-duty`）必须等于：
+#    · 设置命名空间（ctx.settings.update(ns) 的 ns）
+#    · 插件家目录名（$DSH_HOME/pixiv-duty）
+#  三处不一致会出现「设置面板里改了不生效」。
+# ============================================================================
+
+- insert:
+    - id: pixiv-duty
+      name: dsh-pixiv-scroll
+      config:
+        enabled: true
+        authState: none
