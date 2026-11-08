@@ -69,22 +69,25 @@ window.__ModuleLoader__.load({
     }
     const request = async (p, opts = {}) => {
       const b = await resolveBase()
+      // timeoutMs 不进 fetch —— /run 可能要等代理就绪（十几秒），默认 10 秒放不下
+      const { timeoutMs = 10000, ...init } = opts
       const ctl = new AbortController()
-      const timer = setTimeout(() => ctl.abort(), 10000)
+      const timer = setTimeout(() => ctl.abort(), timeoutMs)
       try {
-        const res = await fetch(b + p, { credentials: 'same-origin', ...opts, signal: ctl.signal })
+        const res = await fetch(b + p, { credentials: 'same-origin', ...init, signal: ctl.signal })
         return await asJson(res)
       } catch (e) {
-        if (e?.name === 'AbortError') throw new Error(`请求超时（10 秒）—— 插件后端没响应（${b}），看 duty.log`)
+        if (e?.name === 'AbortError') throw new Error(`请求超时（${Math.round(timeoutMs / 1000)} 秒）—— 插件后端没响应（${b}），看 duty.log`)
         if (e instanceof TypeError) throw new Error(`网络错误（${e.message}）—— 找不到插件后端（试过 ${CANDIDATES.join(' 与 ')}）`)
         throw e
       } finally { clearTimeout(timer) }
     }
     const jget = (p) => request(p)
-    const jpost = (p, body) => request(p, {
+    const jpost = (p, body, timeoutMs) => request(p, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body || {}),
+      ...(timeoutMs ? { timeoutMs } : {}),
     })
 
     const CSS = `
@@ -124,6 +127,13 @@ window.__ModuleLoader__.load({
 [data-px-say][data-tone=ok]{background:rgba(22,163,74,.1);color:#15803d;}
 [data-px-grid]{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;}
 [data-px-bar]{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+[data-px-syncbar]{display:flex;gap:8px;align-items:center;padding:0 0 8px;
+  border-bottom:1px solid var(--dsw-alias-border-secondary,rgba(128,128,128,.22));}
+[data-px-list]{display:flex;flex-direction:column;gap:6px;max-height:330px;overflow:auto;}
+[data-px-pick]{display:flex;gap:8px;align-items:flex-start;padding:6px 8px;border-radius:8px;
+  background:rgba(128,128,128,.06);}
+[data-px-pickbox]{display:flex;gap:6px;align-items:center;padding-top:1px;flex:none;}
+[data-px-idx]{min-width:16px;text-align:right;font-size:11px;color:var(--dsw-alias-label-tertiary,#9aa0a6);}
 `
 
     function Switch({ on, onChange, disabled }) {
@@ -158,7 +168,7 @@ window.__ModuleLoader__.load({
     /**
      * 文本字段：本地立即显示，失焦/回车才提交 —— 避免每敲一个字打一次接口。
      */
-    function TextField({ label, note, value, onCommit, placeholder, textarea, password, type = 'text' }) {
+    function TextField({ label, note, value, onCommit, placeholder, textarea, password, type = 'text', action }) {
       const [v, setV] = React.useState(value ?? '')
       const last = React.useRef(value ?? '')
       React.useEffect(() => {
@@ -186,8 +196,10 @@ window.__ModuleLoader__.load({
           h('textarea', { ...common, 'data-px-ta': '' }))
       }
       return h(Row, { label, note },
-        h('div', { style: { flex: '0 1 260px', width: 260, minWidth: 0, maxWidth: '100%' } },
-          h('input', common)))
+        h('div', { 'data-px-bar': '' },
+          h('div', { style: { flex: '0 1 260px', width: 260, minWidth: 0, maxWidth: '100%' } },
+            h('input', common)),
+          action || null))
     }
 
     function NumberField({ label, note, value, onCommit, min, max, disabled, fraction }) {
@@ -221,6 +233,8 @@ window.__ModuleLoader__.load({
       const [tok, setTok] = React.useState('')
       const [loginStep, setLoginStep] = React.useState('')
       const [report, setReport] = React.useState('')
+      const [lib, setLib] = React.useState(null)
+      const [syncing, setSyncing] = React.useState(false)
 
       const notify = (text, tone = '') => setSay({ text, tone })
 
@@ -251,15 +265,45 @@ window.__ModuleLoader__.load({
         try {
           const r = await jpost('/config', patch)
           setCfg(r.config)
-          if (!r.synced) notify('已保存到插件；但没能同步到 DSH 原生设置（以这里为准）', '')
+          if (!r.synced) notify('已存到插件；DSH 原生设置还没跟上（点顶部「保存更改」可以再推一遍）', '')
           else notify('已保存', 'ok')
         } catch (e) { notify(`保存失败：${e.message}`, 'bad') }
+      }
+
+      /* 「保存更改」：把 config.json 的现值整体推一遍到 DSH 原生设置 */
+      const syncAll = async () => {
+        setSyncing(true)
+        try {
+          const r = await jpost('/config/sync', {}, 30000)
+          if (r.synced) { notify(`已把 ${r.keys} 项同步到 DSH 原生设置`, 'ok'); await refresh() }
+          else notify(`没能同步：${r.reason || '未知原因'}（配置本身已经生效，以本页为准）`, 'bad')
+        } catch (e) { notify(`同步失败：${e.message}`, 'bad') } finally { setSyncing(false) }
+      }
+
+      /* 点「选…」弹系统原生文件夹选择框：起 job → 轮询 → 选中就保存（保存会把整棵树搬过去） */
+      const pickRoot = async () => {
+        setBusy('pick')
+        try {
+          const start = await jpost('/pick-dir', { initial: cfg.saveRoot || status?.env?.saveRoot || '', title: '选择作品库根目录（all_works 的上一层）' })
+          if (!start?.id) throw new Error(start?.error || '打不开选择框')
+          let picked = ''
+          for (let i = 0; i < 260; i++) {
+            await new Promise((r) => setTimeout(r, 700))
+            const s = await jget(`/pick-dir/status?id=${encodeURIComponent(start.id)}`)
+            if (s.status === 'ok') { picked = s.path; break }
+            if (s.status === 'cancelled') break
+            if (s.status === 'failed' || s.status === 'gone') throw new Error(s.error || '选择失败')
+          }
+          if (picked && picked !== (cfg.saveRoot || '')) await save({ saveRoot: picked })
+          else if (!picked) notify('没选路径（取消或窗口已关）', '')
+        } catch (e) { notify(`选目录失败：${e.message}`, 'bad') } finally { setBusy('') }
       }
 
       const runNow = async () => {
         setBusy('run')
         try {
-          const r = await jpost('/run', {})
+          // 后端可能先等代理软件起来（默认最多 25 秒），这里给足超时
+          const r = await jpost('/run', {}, 70000)
           notify(`已开跑：${r.roundId}（profile=${r.profile}）`, 'ok')
           setTimeout(refresh, 1500)
         } catch (e) { notify(`开跑失败：${e.message}`, 'bad') } finally { setBusy('') }
@@ -314,6 +358,49 @@ window.__ModuleLoader__.load({
         } catch (e) { notify(`读报告失败：${e.message}`, 'bad') }
       }
 
+
+      const loadLibrary = React.useCallback(async (repair) => {
+        setBusy('lib')
+        try {
+          if (repair) {
+            const r = await jpost('/library/repair', {}, 120000)
+            const a = r.audit || r
+            setLib(a)
+            const n = (r.repaired || []).length + (r.removed || []).length
+            notify(a.ok ? `修好了${n ? `（动了 ${n} 处链接）` : ''}：${a.works} 件在库` : `还有问题：${(a.issues || []).map((i) => i.detail || i.code).join('；')}`, a.ok ? 'ok' : '')
+          } else {
+            const r = await jget('/library')
+            setLib(r)
+          }
+        } catch (e) { notify(`体检失败：${e.message}`, 'bad') } finally { setBusy('') }
+      }, [])
+
+      React.useEffect(() => { loadLibrary(false) }, [loadLibrary])
+
+      const repairLib = () => loadLibrary(true)
+
+      const rollbackLib = async () => {
+        if (!window.confirm('按最新存档把缺的、变小的作品补回来？（只补不删）')) return
+        setBusy('rollback')
+        try {
+          const r = await jpost('/library/rollback', {}, 900000)
+          const n = (r.rolledBack || []).length
+          notify(`回滚：补回 ${n} 件${r.stillMissing?.length ? `，还差 ${r.stillMissing.length} 件` : ''}`, r.stillMissing?.length ? '' : 'ok')
+          loadLibrary(false)
+        } catch (e) { notify(`回滚失败：${e.message}`, 'bad') } finally { setBusy('') }
+      }
+
+      const restoreLib = async () => {
+        setBusy('restore')
+        try {
+          const r = await jpost('/library/restore', { limit: 10 }, 900000)
+          const ok = (r.restored || []).filter((x) => x.ok || x.saved).length
+          notify(`恢复了 ${ok} 件${r.remaining ? `，还剩 ${r.remaining} 件缺失` : ''}`, ok ? 'ok' : '')
+          loadLibrary(false)
+        } catch (e) { notify(`恢复失败：${e.message}`, 'bad') } finally { setBusy('') }
+      }
+
+
       if (!cfg) {
         return h('div', { 'data-px': '' },
           h('div', {
@@ -342,6 +429,18 @@ window.__ModuleLoader__.load({
         : null
 
       return h('div', { 'data-px': '' },
+
+        /* 最上面：保存 / 同步 */
+        h('div', { 'data-px-syncbar': '' },
+          h('div', {
+            'data-px-note': '', 'data-warn': status?.unsynced?.length ? '' : undefined, 'data-px-grow': '',
+          }, status?.unsynced?.length
+            ? `有 ${status.unsynced.length} 项还没同步到 DSH 原生设置（以本页为准）`
+            : '改一项就存一项；点右边可以把这份配置整体推一遍到 DSH 原生设置'),
+          h('button', {
+            'data-px-btn': '', 'data-primary': '', disabled: syncing, onClick: syncAll,
+          }, syncing ? '同步中…' : '保存更改'),
+        ),
 
         /* 状态条 */
         h('div', { 'data-px-bar': '' },
@@ -531,13 +630,25 @@ window.__ModuleLoader__.load({
         /* 保存 */
         h(Section, { title: '保存到哪' },
           h(TextField, {
-            label: '保存根目录', note: `空 = 插件家目录下的 library（当前：${status?.env?.saveRoot || ''}）`,
-            value: cfg.saveRoot, placeholder: 'D:\\Pixiv',
+            label: '作品库根目录',
+            note: `空 = 插件家目录下的 Download（当前：${status?.env?.saveRoot || ''}）。原图在 all_works；改这里会把整棵树一起搬过去。`,
+            value: cfg.saveRoot, placeholder: '留空 = 插件家目录；或点右边选一个',
             onCommit: (v) => save({ saveRoot: v }),
+            action: h('button', {
+              'data-px-btn': '', disabled: busy === 'pick',
+              onClick: pickRoot,
+            }, busy === 'pick' ? '等你在窗口里选…' : '选…'),
           }),
           h(TextField, {
-            label: '目录模板', note: '占位符 {kind} {artist} {title} {id} {year}；必须含 {id}',
-            value: cfg.dirTemplate, onCommit: (v) => save({ dirTemplate: v }),
+            label: '作品命名方式',
+            note: '占位符 {artistId} {artist} {title} {id} {kind} {rating} {year}；必须含 {id}。默认 {artistId}_{title}_{id}',
+            value: cfg.workTemplate, onCommit: (v) => save({ workTemplate: v }),
+          }),
+          h(TextField, {
+            label: '镜像标签（默认停用）',
+            note: '默认留空。分类可以交给选装的 DSH 画廊（它做虚拟标签，不在磁盘建文件夹）；本插件不依赖它，留空也照常运行。填了会在同名文件夹建 junction，一般不建议。',
+            value: (cfg.mirrorTags || []).join(','),
+            onCommit: (v) => save({ mirrorTags: String(v).split(/[,，]/).map((s) => s.trim()).filter(Boolean) }),
           }),
           h(ToggleRow, {
             label: '存好自动打开文件夹',
@@ -545,18 +656,116 @@ window.__ModuleLoader__.load({
             on: cfg.openAfterSave, onChange: (v) => save({ openAfterSave: v }),
           }),
           h('div', { 'data-px-bar': '' },
-            h('button', { 'data-px-btn': '', onClick: () => jpost('/open', { target: 'root' }).catch(() => {}) }, '打开保存目录'),
+            h('button', { 'data-px-btn': '', onClick: () => jpost('/open', { target: 'root' }).catch(() => {}) }, '打开作品库'),
             h('button', { 'data-px-btn': '', onClick: () => jpost('/open', { target: 'out' }).catch(() => {}) }, '打开报告目录'),
             h('span', { 'data-px-note': '' }, status?.env?.saveRootWritable ? '可写' : `不可写：${status?.env?.error || '未知'}`),
           ),
+          h('div', { 'data-px-note': '' }, '开跑前先查库（三选一，互斥）：对不上就回滚 / 只弹窗问你 / 都不管'),
+          h('div', { 'data-px-bar': '' },
+            ...[['auto', '出错就回滚+弹窗'], ['ask', '只弹窗问我'], ['off', '都不管']].map(([v, label]) => h('button', {
+              'data-px-btn': '', 'data-primary': cfg.libGuard === v ? '' : undefined,
+              onClick: () => save({ libGuard: v }),
+            }, (cfg.libGuard === v ? '● ' : '') + label)),
+          ),
+          h(NumberField, { label: '弹窗等你几秒', note: '只弹窗问的时候，超时当「不回滚」继续跑', value: cfg.guardWaitSec, min: 0, max: 600, onCommit: (v) => save({ guardWaitSec: v }) }),
+          h(NumberField, { label: '候选缓存保留天数', note: '没过期前能回看缩略图；过期只留「当天选了哪些」', value: cfg.cacheDays, min: 7, max: 365, onCommit: (v) => save({ cacheDays: v }) }),
+          h(NumberField, { label: '删除记录保留天数', note: '误删恢复的依据保留多久，过期就清掉', value: cfg.deleteRecordDays, min: 30, max: 3650, onCommit: (v) => save({ deleteRecordDays: v }) }),
+        ),
+
+        /* 推送模式：只推已关注作者（下一轮生效） */
+        h(Section, {
+          title: `推送模式 · ${cfg.followedOnly ? '仅已关注作者' : '都推'}`,
+        },
+          h('div', { 'data-px-bar': '' },
+            h('button', { 'data-px-btn': '', 'data-primary': !cfg.followedOnly ? '' : undefined, onClick: () => save({ followedOnly: false }) }, (!cfg.followedOnly ? '● ' : '') + '都推'),
+            h('button', { 'data-px-btn': '', 'data-primary': cfg.followedOnly ? '' : undefined, onClick: () => save({ followedOnly: true }) }, (cfg.followedOnly ? '● ' : '') + '只推已关注作者'),
+          ),
+          h('div', { 'data-px-note': '' }, '标签权重和 ≥ 下限且作者被你关注 → 可推；权重和 > 必推线 → 必推（不看关注）。开关只对下一轮生效，本轮不受影响。'),
+          h(NumberField, { label: '可推的最低权重和', value: cfg.minPushWeight, min: -10, max: 20, onCommit: (v) => save({ minPushWeight: v }) }),
+          h(NumberField, { label: '必推线（超过就必推）', value: cfg.mustPushWeight, min: 0, max: 50, onCommit: (v) => save({ mustPushWeight: v }) }),
+          h(TextField, {
+            label: '不喜欢的标签（逗号分隔）',
+            note: '命中这些标签就按下面的权重扣分，默认 -1',
+            value: (cfg.dislikeTags || []).join(','),
+            onCommit: (v) => save({ dislikeTags: String(v).split(/[,，]/).map((s) => s.trim()).filter(Boolean) }),
+          }),
+          h(NumberField, { label: '不喜欢标签的权重', value: cfg.dislikeWeight, min: -10, max: 0, onCommit: (v) => save({ dislikeWeight: v }) }),
+          h('div', { 'data-px-bar': '' },
+            h('button', {
+              'data-px-btn': '', disabled: busy === 'follow',
+              onClick: async () => {
+                setBusy('follow')
+                try {
+                  const r = await jpost('/following/refresh', {}, 180000)
+                  notify(r.ok ? `关注列表：${r.total} 位作者` : `拉取失败：${r.error || r.message || '未知'}`, r.ok ? 'ok' : 'warn')
+                } catch (e) { notify(String(e?.message || e), 'warn') } finally { setBusy('') }
+              },
+            }, busy === 'follow' ? '读取中…' : '读取我的关注列表'),
+            h('span', { 'data-px-note': '' }, '推送模式要先有这份名单；读取失败时用上次缓存'),
+          ),
+        ),
+
+        /* 作品库体检：目录 / 文件 / 快捷方式 都在不在 */
+        h(Section, {
+          title: lib ? `作品库体检 · ${lib.ok ? '完好' : '有问题'}` : '作品库体检',
+          extra: h('div', { 'data-px-bar': '' },
+            h('button', { 'data-px-btn': '', disabled: busy === 'lib', onClick: () => loadLibrary(true) }, busy === 'lib' ? '体检中…' : '重新体检'),
+            h('button', { 'data-px-btn': '', disabled: busy === 'lib', onClick: repairLib }, '修一下')),
+        },
+          lib
+            ? h('div', { 'data-px-note': '' },
+                `${lib.works || 0} 件在库 · ${(lib.tags || []).length} 个镜像标签${lib.bytes ? ' · ' + (lib.bytes / 1048576).toFixed(1) + ' MB' : ''}`)
+            : h('div', { 'data-px-note': '' }, '正在体检…'),
+          lib && !lib.ok
+            ? h('div', { 'data-px-note': '', 'data-warn': '' },
+                (lib.issues || []).map((i) => i.detail || i.msg || i.code).join('；') +
+                (lib.missing?.length ? `｜缺失 ${lib.missing.length} 件（可恢复）` : ''))
+            : null,
+          lib && lib.missing?.length
+            ? h('div', { 'data-px-bar': '' },
+                h('button', {
+                  'data-px-btn': '', 'data-primary': '', disabled: busy === 'restore', onClick: restoreLib,
+                }, busy === 'restore' ? '恢复中…' : `恢复缺失的 ${lib.missing.length} 件`),
+                h('span', { 'data-px-note': '' }, '按台账重新下载，不占每日额度'))
+            : null,
+          lib?.snapshot
+            ? h('div', { 'data-px-note': '' },
+                `存档 ${lib.snapshot.prevDirs ?? '—'} 件 / ${lib.snapshot.prevBytes ? (lib.snapshot.prevBytes / 1048576).toFixed(1) + ' MB' : '—'}` +
+                ` ｜ 现况 ${lib.snapshot.dirs || 0} 件 / ${((lib.snapshot.bytes || 0) / 1048576).toFixed(1)} MB` +
+                ` ｜ ${lib.snapshot.matched ? '对得上' : '缺 ' + (lib.snapshot.missing || 0) + ' 件、少文件 ' + (lib.snapshot.shrunk || 0) + ' 件'}`)
+            : null,
+          lib && lib.snapshot && !lib.snapshot.matched
+            ? h('div', { 'data-px-bar': '' },
+                h('button', { 'data-px-btn': '', 'data-primary': '', disabled: busy === 'rollback', onClick: rollbackLib }, busy === 'rollback' ? '回滚中…' : '回滚到最新存档'),
+                h('span', { 'data-px-note': '' }, '只补不删；残件进 trash/'))
+            : null,
+          h('div', { 'data-px-note': '' }, `库根目录：${lib?.libRoot || status?.env?.saveRoot || ''}`),
+          h('div', { 'data-px-note': '' },
+            '选装联动：和 DSH 画廊一起用时，画廊会来读这里的轮次页、候选清单和缩略图，评分与点头下载都在画廊里；没装画廊本插件照样跑，只是没有评分界面。'),
         ),
 
         /* 网络 */
         h(Section, { title: '网络' },
           h(TextField, {
-            label: '访问 Pixiv 的代理', note: '留空 = 直连；国内多数网络需要填，例如 http://127.0.0.1:12000',
-            value: cfg.proxyUrl, placeholder: 'http://127.0.0.1:12000',
+            label: '访问 Pixiv 的代理', note: '留空 = 直连；国内多数网络需要填，例如 http://127.0.0.1:7890',
+            value: cfg.proxyUrl, placeholder: 'http://127.0.0.1:7890',
             onCommit: (v) => save({ proxyUrl: v.trim() }),
+          }),
+          h(ToggleRow, {
+            label: '跑之前自动开代理（VPN）',
+            note: '代理端口连不上就先启动下面这个程序，等它就绪再开跑（关掉 = 只记日志，不启动任何程序）',
+            on: cfg.vpnAuto, onChange: (v) => save({ vpnAuto: v }),
+          }),
+          h(TextField, {
+            label: '代理软件主程序路径',
+            note: 'Clash / V2RayN / Shadowsocks 之类都行，要 GUI 那个 exe，不是内核。留空 = 不自动拉',
+            value: cfg.vpnPath, placeholder: 'C:\\Program Files\\Clash for Windows\\Clash for Windows.exe',
+            onCommit: (v) => save({ vpnPath: v.trim() }),
+          }),
+          h(NumberField, {
+            label: '拉起后最多等几秒', note: '冷启动一般 5–15 秒；超时就放弃这一轮并写进 duty.log',
+            value: cfg.vpnWaitSec, min: 3, max: 120,
+            onCommit: (v) => save({ vpnWaitSec: v }),
           }),
         ),
 
@@ -634,9 +843,6 @@ window.__ModuleLoader__.load({
               background: 'rgba(128,128,128,.07)', borderRadius: 8, padding: 10, margin: 0,
             },
           }, report) : h('div', { 'data-px-note': '' }, status?.last ? `上一轮：存 ${status.last.saved} 件 · ${String(status.last.at).slice(0, 16)}` : '还没跑过'),
-          status?.unsynced?.length
-            ? h('div', { 'data-px-note': '', 'data-warn': '' }, `有 ${status.unsynced.length} 项没能同步到 DSH 原生设置（以本页为准）`)
-            : null,
         ),
       )
     }

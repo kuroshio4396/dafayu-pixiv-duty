@@ -27,6 +27,8 @@ import { stateDirOf, ensureDirs, ensureHomeFiles, ensureCharter, appendLog, dayK
 import { createToolset } from './lib/toolset.mjs'
 import { registerHttp } from './lib/http.mjs'
 import { runRound } from './lib/runner.mjs'
+import { startLocalServer } from './lib/localsrv.mjs'
+import { previewState } from './lib/preview.mjs'
 
 const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url))
 
@@ -80,6 +82,26 @@ export function apply(ctx, config = {}) {
     log,
   })
 
+  // ── 预览页回环服务（勾选后直接落盘要靠它） ──
+  let localSrv = null
+  startLocalServer({
+    home,
+    getCfg: () => loadCfg(home),
+    approve: (x) => toolset.approve(x),
+    log,
+  }).then((srv) => {
+    localSrv = srv
+    previewState.origin = srv.origin
+    previewState.port = srv.port
+    previewState.startedAt = new Date().toISOString()
+    previewState.error = null
+    log(`预览服务已就绪：${srv.origin}`)
+  }).catch((e) => {
+    previewState.error = String(e?.message ?? e)
+    log(`预览服务起不来：${previewState.error}`)
+  })
+  ctx.effect(() => () => { try { localSrv?.dispose?.() } catch { /* ignore */ } }, 'pixiv-duty: preview-server')
+
   // ── HTTP ──
   try {
     const api = registerHttp(ctx, { home, toolset, log })
@@ -115,16 +137,21 @@ export function apply(ctx, config = {}) {
 
       const rid = `${dayKey()}-${slot}-${Date.now().toString(36)}`
       const since = Date.now()
-      const r = runRound({
+      // runRound 是 async 的（跑之前要探测/拉起代理），这里用 .then 收口，别让异常冒到定时器
+      runRound({
         home, cfg, roundId: rid, why: `window:${slot}`, log,
+        restore: (x) => toolset.restore(x),
         onExit: () => {
           // 跑完把会话挂进工作区（否则它落在「未分组」）
           adoptSessions(ctx, { home, cfg: loadCfg(home), since, log })
             .then((x) => { if (!x.ok) log(`会话归组跳过：${x.note}`) })
             .catch((e) => log(`会话归组异常：${e?.message ?? e}`))
         },
+      }).then((r) => {
+        log(`自动跑（${slot}）：${r.started ? `已启动 ${rid}` : `跳过 ${r.error}`}`)
+      }).catch((e) => {
+        try { appendLog(home, `[host] 自动跑异常：${e?.message ?? e}`) } catch { /* 忽略 */ }
       })
-      log(`自动跑（${slot}）：${r.started ? `已启动 ${rid}` : `跳过 ${r.error}`}`)
     } catch (e) {
       // ⚠️ 定时器回调里冒异常会杀掉整个宿主 —— 必须自己吞掉
       try { appendLog(home, `[host] 定时器异常：${e?.message ?? e}`) } catch { /* 忽略 */ }

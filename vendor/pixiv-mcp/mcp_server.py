@@ -73,6 +73,34 @@ async def px_auth(action: str = "status") -> str:
 
 
 @tool()
+async def px_following(limit: int = 500) -> str:
+    """读取当前账号的关注列表（作者 userId 列表）。用于「只推送已关注作者」模式。"""
+    try:
+        cred = px_client.load_credential()
+        uid = int(cred.get("userId") or 0)
+        if not uid:
+            return ok({"ok": False, "code": "AUTH_REQUIRED", "message": "还没登录"})
+        api = px_client.get_client()
+        cap = max(1, min(int(limit or 500), 3000))
+        out = []
+        offset = 0
+        while len(out) < cap:
+            res = px_client.call(api.user_following, uid, restrict="public", offset=str(offset))
+            prevs = res.get("user_previews") or []
+            if not prevs:
+                break
+            for p in prevs:
+                u = p.get("user") or {}
+                if u.get("id"):
+                    out.append({"id": int(u["id"]), "name": u.get("name") or "", "account": u.get("account") or ""})
+            offset += len(prevs)
+            if len(prevs) < 30:
+                break
+        return ok({"ok": True, "userId": uid, "total": len(out), "users": out[:cap]})
+    except Exception as e:
+        return fail(e)
+
+@tool()
 async def px_search(queries: str, kind: str = "all", days: int = 7, limit: int = 20, sort: str = "date_desc") -> str:
     """搜索插画/漫画/小说。queries 用 || 分隔（最多 3 个），例如 "原神||厚涂" """
     try:

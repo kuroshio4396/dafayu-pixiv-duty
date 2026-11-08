@@ -48,12 +48,16 @@
   如果用户在别的工具里也用同一个 token，会互相踢掉，只能重新登录。
 - **无头登录可能被 reCAPTCHA 拦**：面板会提示。退路一：`PIXIV_LOGIN_HEADLESS=0` 用有头 Edge；
   退路二：手贴 refresh_token。不要反复重试同一个失败。
-- **桌面版（Electron）**：`dsh` 不在 PATH。把 `dshBin` 指到
-  `<安装目录>\resources\runtime\cli\bin\dsh.cmd`（包装内部已设 `ELECTRON_RUN_AS_NODE`，并带 `--expose-internals`）。
+- **桌面版（Electron）**：`dsh` 不在 PATH。`dshBin` 填了就按它走；没填时 `resolveDsh` 自动探测
+  `<安装目录>\resources\runtime\cli\bin\dsh.cmd`（旧版桌面版还可能发 `bin.js` / `dsh.exe`）。
+  `.cmd` 包装内部已设 `ELECTRON_RUN_AS_NODE`，并带 `--expose-internals`。
   ⚠️ **不要**让 headless 去解析包名 `dsh-pixiv-scroll/agent` —— headless profile 里没装本插件；
   overlay 里用**绝对路径**（`lib/runner.mjs` 的 `DEFAULT_AGENT_ENTRY` 已经这么做了）。
-- **网络**：国内环境必须配 `proxyUrl`（如 `http://127.0.0.1:12000`）。Node 与 Python 直连 Pixiv 会被阻断，
+- **网络**：国内环境必须配 `proxyUrl`（如 `http://127.0.0.1:7890`）。Node 与 Python 直连 Pixiv 会被阻断，
   而 Edge 走系统代理能通 —— 典型症状是"登录成功、搜索 0 条"。
+  `runRound` 起子会话前会 `ensureProxy()`：先 TCP 探一次代理端口，不通且 `vpnAuto` 开着就
+  `spawn(vpnPath)` 拉起代理软件（Clash / V2RayN 都行），最多等 `vpnWaitSec` 秒；超时则这一轮不跑（`/run` 返回 409 并写 duty.log）。
+  探活只看端口通不通，不验证它是不是真代理。
   Python `requests` 认**小写** `https_proxy`，父进程里的沙箱代理会盖掉大写变量，所以 `lib/toolset.mjs`
   一次写全 6 个键（大小写各三份）。
 - **一轮里没有 bash / write / edit**：这是故意的。落盘只能走 `pixiv_save`，

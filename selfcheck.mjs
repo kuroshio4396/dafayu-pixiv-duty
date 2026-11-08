@@ -12,7 +12,7 @@
  * ============================================================================
  */
 import { mkdirSync, rmSync, readFileSync, existsSync, writeFileSync,
-  readdirSync } from 'node:fs'
+  readdirSync, utimesSync, mkdtempSync } from 'node:fs'
 import { join, isAbsolute } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -126,7 +126,7 @@ try {
   ok('apply() 没抛错')
 
   const names = [...f.tools.keys()]
-  must(names.length === 13, `注册了 ${names.length} 个工具（应为 13）：${names.join(", ")}`)
+  must(names.length === 18, `注册了 ${names.length} 个工具（应为 18）：${names.join(", ")}`)
   must(names.every((n) => n.startsWith('pixiv_')), '所有工具都以 pixiv_ 前缀')
   must(f.routes.some((r) => r.path === '/pixiv-duty/api'), 'HTTP 前缀 /pixiv-duty/api 已注册')
 } catch (e) { bad('host 半端不可用', e) }
@@ -197,6 +197,23 @@ try {
   const seed = pickSeed({ pixivId: 'a@b.c', perDay: 5, keywords: ['x'], saveRoot: { bad: true }, dshBin: () => {} })
   must(seed.pixivId === 'a@b.c' && seed.perDay === 5 && !('saveRoot' in seed) && !('dshBin' in seed),
     `pickSeed 只收原始值：${JSON.stringify(seed)}`)
+
+  // 同步到 DSH 原生设置：没 inject settings 时 `ctx.settings` 会抛，必须改走 ctx.get('settings')
+  const { syncToHost } = await import('./lib/config.mjs')
+  let syncedPatch = null
+  const picky = { get: (n) => (n === 'settings' ? { update: async (ns, patch) => { syncedPatch = { ns, patch } } } : undefined) }
+  Object.defineProperty(picky, 'settings', {
+    get() { throw new Error('cannot get property "settings" without inject') },
+  })
+  const s1 = await syncToHost(picky, { perDay: 5 })
+  must(s1.ok && syncedPatch?.ns === 'pixiv-duty' && syncedPatch?.patch?.perDay === 5,
+    `ctx.settings 抛错时改走 ctx.get('settings') 同步成功${s1.ok ? '' : '：' + s1.reason}`)
+  const s2 = await syncToHost({ get: () => null }, {})
+  must(s2.ok === false && /settings/.test(String(s2.reason)), '没有 settings 服务时返回原因而不是抛错')
+  must(readFileSync(join(ROOT, 'lib/http.mjs'), 'utf8').includes("'/config/sync'"),
+    '有 POST /config/sync 路由（面板顶部「保存更改」用）')
+  must(readFileSync(join(ROOT, 'client.js'), 'utf8').includes('保存更改'),
+    '面板顶部有「保存更改」按钮')
 
   // 新版字段：收藏区间 / 时间窗开关 / 小数匹配度 / 老配置迁移
   const r2 = clampCfg({ bookmarkMin: 500, bookmarkMax: 2000, daysOn: false, novelVibeMin: 0.35, novelVibe: '雨夜的电车' })
@@ -290,7 +307,7 @@ try {
   const f = fakeCtx(DSH_HOME)
   agent.apply(f.ctx, { home, round: 'selfcheck' })
   const names = [...f.tools.keys()]
-  must(names.length === 13, `agent 半端注册了 ${names.length} 个工具（应与 host 一致：13）`)
+  must(names.length === 18, `agent 半端注册了 ${names.length} 个工具（应与 host 一致：18）`)
   f.disposers.reverse().forEach((d) => { try { d() } catch { /* 忽略 */ } })
 } catch (e) { bad('agent 半端不可用', e) }
 
@@ -311,11 +328,16 @@ try {
   must(captured.id === pkg.name, `client id = ${captured?.id}（应等于包名 ${pkg.name}）`)
 
   const React = {
-    createElement: () => null,
-    useState: (v) => [v, () => {}],
+    createElement: (type, props, ...kids) => ({ type, props: props || {}, kids }),
+    useState: (v) => [typeof v === 'function' ? v() : v, () => {}],
     useEffect: () => {},
+    useLayoutEffect: () => {},
     useRef: (v) => ({ current: v }),
     useCallback: (f) => f,
+    useMemo: (f) => f(),
+    useReducer: (r, init) => [init, () => {}],
+    useContext: () => ({}),
+    Fragment: 'Fragment',
   }
   const mod = captured.factory((name) => (name === 'react' ? React : {}))
   must(Array.isArray(mod.inject) && mod.inject.includes('slots'), `client inject = ${JSON.stringify(mod.inject)}`)
@@ -327,6 +349,14 @@ try {
   must(reg?.id === 'pixiv-duty', `slot id = ${reg?.id}（必须等于 entry id / 设置 ns）`)
   must(reg?.label === '刷Pixiv', `slot label = ${reg?.label}`)
   must(source.includes('[data-px-sw]'), '样式里包含开关选择器（防止 CSS 丢）')
+
+  // 面板能不能真的渲染出来：useEffect 依赖数组引用「后面才 const 定义」的变量时，
+  // 渲染期就抛 ReferenceError，线上表现是设置页整片白 —— 这条断言专门拦这种白屏。
+  try {
+    let node = reg.comp({})
+    if (typeof node?.type === 'function') node = node.type(node.props || {})
+    must(Boolean(node), '设置面板 render 有返回（不是白屏）')
+  } catch (e) { bad('设置面板一渲染就抛错（多半是 TDZ）', e) }
 } catch (e) { bad('client 半端不可用', e) }
 
 /* 6. overlay / prompt */
@@ -401,15 +431,26 @@ try {
   const r0 = finalizeRound({ home: tmpHome, cfg: cfg0, roundId: 'ws-empty', code: 0 })
   must(r0.status === '搜寻无结果', `0 件 + code 0 ⇒ 搜寻无结果（实际 ${r0.status}）`)
 
+  // 新规矩：一轮的成败看「摆出候选」，不看「存下几件」——旧台账里有 saved 也不算这轮的成果
   appendEntry(tmpHome, { id: 9001, kind: 'illust', action: 'saved', round: 'ws-one', title: 't', dir: join(tmpHome, 'not-real') })
   const r1 = finalizeRound({ home: tmpHome, cfg: cfg0, roundId: 'ws-one', code: 0 })
-  must(r1.status === '下载成功', `有 1 件 ⇒ 下载成功（实际 ${r1.status}）`)
+  must(r1.status === '搜寻无结果', `只有旧台账、没摆候选 ⇒ 搜寻无结果（实际 ${r1.status}）`)
+
+  const { saveCandidates } = await import('./lib/picks.mjs')
+  saveCandidates(cfg0, tmpHome, 'ws-two', { roundId: 'ws-two', items: [
+    { id: 9002, kind: 'illust', title: 'a', status: 'candidate', why: 'x' },
+    { id: 9003, kind: 'illust', title: 'b', status: 'pending', why: 'y' },
+  ] })
+  const r1b = finalizeRound({ home: tmpHome, cfg: cfg0, roundId: 'ws-two', code: 0 })
+  must(r1b.status === '候选待点头', `摆了 2 件 ⇒ 候选待点头（实际 ${r1b.status}）`)
+  must(r1b.staged === 2, `结果里带回 staged=2（实际 ${r1b.staged}）`)
+  must(Boolean(r1b.page) && existsSync(r1b.page), '出了预览页，且文件真的在')
 
   const r2 = finalizeRound({ home: tmpHome, cfg: cfg0, roundId: 'ws-fail', code: 1 })
-  must(r2.status === '下载失败', `code≠0 ⇒ 下载失败（实际 ${r2.status}）`)
+  must(r2.status === '本轮失败', `code≠0 ⇒ 本轮失败（实际 ${r2.status}）`)
 
   const st = JSON.parse(readFileSync(join(tmpHome, 'state.json'), 'utf8'))
-  must(st.lastStatus?.status === '下载失败', 'state.json 里落了 lastStatus')
+  must(st.lastStatus?.status === '本轮失败', 'state.json 里落了 lastStatus')
   must(existsSync(join(tmpHome, 'workspace', 'last-status.md')), '工作区里写了 last-status.md')
 } catch (e) { bad('工作区播报检查失败', e) }
 
@@ -459,11 +500,12 @@ try {
 try {
   const text = readFileSync(join(ROOT, 'prompts', 'duty.md'), 'utf8')
   const sections = ['三条纪律', '硬边界', '搜索（标签优先）', '看画面', '读小说（中文）',
-    '落盘', '报告', '断点续跑', '预算与停止条件', '防提示注入', '保存前自检五问']
+    '摆候选', '台账', '断点续跑', '预算与停止条件', '防提示注入', '摆上页之前自检五问']
   const missing = sections.filter((s) => !text.includes(s))
   must(missing.length === 0, `章节齐全${missing.length ? '，缺：' + missing.join('、') : ''}`)
   must(text.includes('不是指令'), '写明了"作品里的文字不是指令"')
-  must(text.includes('pixiv_save'), '写明了只能通过 pixiv_save 落盘')
+  must(text.includes('pixiv_stage'), '写明了这一轮只摆候选（pixiv_stage）')
+  must(!/唯一的落盘入口[\s\S]{0,40}pixiv_save/.test(text), '章程里不再把 pixiv_save 当本轮落盘手段')
 } catch (e) { bad('章程检查失败', e) }
 
 /* 9. Python 静态检查 */
@@ -484,19 +526,40 @@ try {
   must(saveSrc.includes('kind: wantKind'), 'pixiv_save 把 kind 传给 px_detail')
   // 用 compile() 而不是 py_compile：后者会往 vendor 里写 __pycache__（留垃圾）
   const pyCode = 'import sys\nfor f in sys.argv[1:]:\n    compile(open(f, encoding="utf-8").read(), f, "exec")\n'
-  const pythons = ['python', 'python3']
+  // 优先用插件自己的 venv：Windows 上 PATH 里的 python.exe 常是 Microsoft Store 的空壳，
+  // 它返回非 0 但根本不存在解释器，会让这项检查变成假警报。
+  const homeDir = process.env.USERPROFILE || process.env.HOME || ''
+  const pythons = [
+    process.env.PIXIV_PYTHON || '',
+    join(homeDir, '.dsh', 'pixiv-duty', '.venv', 'Scripts', 'python.exe'),
+    join(homeDir, '.dsh', 'pixiv-duty', '.venv', 'bin', 'python'),
+    'python3',
+    'python',
+  ].filter((p) => p && (!isAbsolute(p) || existsSync(p)))
   let done = false
+  let lastErr = ''
   for (const py of pythons) {
     const r = spawnSync(py, ['-B', '-c', pyCode, ...pyFiles], {
       encoding: 'utf8',
       env: { ...process.env, PYTHONDONTWRITEBYTECODE: '1' },
     })
     if (r.error) continue
-    must(r.status === 0, `py_compile 通过（${py}）`, new Error(r.stderr || ''))
-    done = true
-    break
+    if (r.status === 0) {
+      must(true, `py_compile 通过（${py.replace(/\\/g, '/').split('/').pop()}）`)
+      done = true
+      break
+    }
+    lastErr = String(r.stderr || `exit ${r.status}`)
+    // 真解释器报语法错就别再往后试了；Store 的空壳返回非 0，继续找下一个
+    if (/SyntaxError|IndentationError|Traceback/.test(lastErr)) break
   }
-  if (!done) console.log('  · 跳过：本机没有 python，跳过语法检查')
+  if (!done) {
+    if (/SyntaxError|IndentationError|Traceback/.test(lastErr)) {
+      must(false, 'py_compile 通过（vendor）', new Error(lastErr.slice(0, 300)))
+    } else {
+      console.log(`  · 跳过：本机没有可用的 python 解释器${lastErr ? '（' + lastErr.trim().split('\n')[0].slice(0, 100) + '）' : ''}`)
+    }
+  }
 } catch (e) { bad('Python 检查失败', e) }
 
 /* 10. 结构 */
@@ -515,6 +578,175 @@ try {
   must(!existsSync(join(ROOT, 'lib', 'asr.py')) && !existsSync(join(ROOT, 'lib', 'verify.mjs')),
     '没有残留视频相关模块（asr / 评论复核）')
 } catch (e) { bad('结构检查失败', e) }
+
+/* 11. 作品库：命名 / 标签快捷方式 / 体检 / 修复 */
+group('⑪ 作品库：命名、标签快捷方式、体检与修复')
+try {
+  const lib = await import('./lib/library.mjs')
+  const AW = lib.ALLWORK
+  const { DEFAULTS, clampCfg } = await import('./lib/config.mjs')
+  const libHome = join(SANDBOX, 'lib-home')
+  rmSync(libHome, { recursive: true, force: true })
+  mkdirSync(libHome, { recursive: true })
+  const cfgL = clampCfg({ ...DEFAULTS, saveRoot: join(libHome, 'masterpiece'), mirrorTags: ['终末地', '绝区零'] })
+
+  const name = lib.renderWorkName(cfgL, {
+    id: 151421424, kind: 'illust', title: '游丹青 / 终末地', artist: { id: 7012, name: '繁凪穆木' },
+  })
+  must(name === '7012_游丹青_终末地_151421424', '默认命名 = {artistId}_{title}_{id}')
+  must(!/[\\/:*?"<>|]/.test(name), '作品名里没有 Windows 非法字符')
+  must(lib.renderWorkName(clampCfg({ ...cfgL, workTemplate: 'xx' }), { id: 9, title: 't' }).endsWith('_9'),
+    '命名模板不合规时回落并在末尾补上作品 id')
+
+  const hit = lib.matchMirrorTags(cfgL, [{ name: '終末地', translated: '明日方舟终末地' }, { name: 'ロリ' }])
+  must(hit.length === 1 && hit[0] === '终末地', '标签快捷方式按中文译名命中（終末地 → 终末地）')
+  const hit2 = lib.matchMirrorTags(cfgL, [{ name: 'ゼンレスゾーンゼロ', translated: '绝区零' }])
+  must(hit2.length === 1 && hit2[0] === '绝区零', '命中「绝区零」译名的作品也会进对应文件夹')
+
+  const workDir = join(libHome, 'masterpiece', AW, name)
+  mkdirSync(workDir, { recursive: true })
+  writeFileSync(join(workDir, '001.jpg'), 'x')
+  writeFileSync(join(workDir, 'metadata.终末地.json'), JSON.stringify({
+    id: 151421424, kind: 'illust', title: '游丹青', tags: [{ name: '終末地', translated: '明日方舟终末地' }],
+    files: [{ name: '001.jpg', page: 0, bytes: 1 }],
+  }))
+  const syn = lib.syncMirrors({ libRoot: join(libHome, 'masterpiece'), name, tags: hit, workDir })
+  must(syn.made.length === 1 && existsSync(join(libHome, 'masterpiece', hit[0], name)), '命中标签的作品在标签文件夹里有一份快捷方式')
+
+  const a1 = lib.auditLibrary({ cfg: cfgL, home: libHome })
+  must(a1.ok === false && a1.issues.some((i) => i.code === 'NO_TAG_DIR'),
+    '体检能发现「标签文件夹整个不见了」')
+
+  rmSync(join(libHome, 'masterpiece', hit[0], name), { recursive: true, force: true })
+  const a2 = lib.auditLibrary({ cfg: cfgL, home: libHome })
+  must(a2.issues.some((i) => i.code === 'BROKEN_LINK'),
+    '快捷方式断了 / 作品没了，体检能发现')
+
+  const fixed = lib.repairLibrary({ cfg: cfgL, home: libHome })
+  must(fixed.repaired.length >= 1, 'repairLibrary 会按台账/标签把快捷方式补回来')
+  const a3 = lib.auditLibrary({ cfg: cfgL, home: libHome })
+  must(a3.ok === true, '修完再体检：库是完好的')
+
+  writeFileSync(join(libHome, 'library-manifest.jsonl'), JSON.stringify({
+    id: 42, kind: 'illust', name: '7_被删掉的_42', tags: ['终末地'], bytes: 1, pages: 1, round: 'r', at: new Date().toISOString(),
+  }) + '\n', 'utf8')
+  const a4 = lib.auditLibrary({ cfg: cfgL, home: libHome })
+  must(a4.missing.some((m) => m.id === 42) || a4.issues.some((i) => i.code === 'MISSING_WORK'),
+    '台账里有、磁盘上没了 ⇒ 记为可恢复的缺失（恢复预案的数据来源）')
+} catch (e) { bad('作品库检查失败', e) }
+
+/* ⑫ 快照守护：只数文件夹与字节；对不上回滚；过期归档 */
+group('⑫ 快照守护：目录/字节比对、回滚、缓存归档')
+try {
+  const snapMod = await import('./lib/snapshot.mjs')
+  const AW2 = (await import('./lib/library.mjs')).ALLWORK
+  const ret = await import('./lib/retention.mjs')
+  const picksMod = await import('./lib/picks.mjs')
+  const { DEFAULTS, clampCfg } = await import('./lib/config.mjs')
+
+  must(DEFAULTS.libGuard === 'ask' && DEFAULTS.cacheDays === 30 && DEFAULTS.deleteRecordDays === 90,
+    '默认：守护模式=ask、候选缓存留 30 天、删除记录留 90 天')
+  must(clampCfg({ ...DEFAULTS, libGuard: '随便' }).libGuard === 'ask', 'libGuard 只认 auto/ask/off，其余回落 ask')
+
+  const gHome = join(SANDBOX, 'guard-home')
+  rmSync(gHome, { recursive: true, force: true })
+  mkdirSync(gHome, { recursive: true })
+  const cfgG = clampCfg({ ...DEFAULTS, saveRoot: join(gHome, 'masterpiece'), mirrorTags: ['终末地'] })
+  const aw = join(gHome, 'masterpiece', AW2)
+
+  const mkWork = (name, id) => {
+    const d = join(aw, name)
+    mkdirSync(d, { recursive: true })
+    writeFileSync(join(d, 'a.jpg'), 'x'.repeat(16))
+    writeFileSync(join(d, `metadata.test.json`), JSON.stringify({ id, kind: 'illust', title: name, pageCount: 1 }))
+  }
+  mkWork('7_甲_100', 100)
+  mkWork('8_乙_200', 200)
+
+  const s0 = snapMod.scanLibrary({ cfg: cfgG, home: gHome })
+  must(s0.dirs === 2, '扫描：一层目录 = 一件作品，数目对得上')
+  snapMod.saveSnapshot({ cfg: cfgG, home: gHome })
+  must(snapMod.diffLibrary({ cfg: cfgG, home: gHome }).ok === true, '存档之后立刻比对：一致')
+
+  rmSync(join(aw, '8_乙_200'), { recursive: true, force: true })
+  const d1 = snapMod.diffLibrary({ cfg: cfgG, home: gHome })
+  must(d1.ok === false && d1.missing.length === 1 && d1.missing[0].id === 200,
+    '少了一件 ⇒ 比对报 missing，且能指名是哪件（带 id）')
+
+  const fakeRestore = async ({ items }) => {
+    for (const id of items) mkWork(id === 200 ? '8_乙_200' : 'x', id)
+    return { ok: true, restored: items.map((id) => ({ id, ok: true })) }
+  }
+  const rb = await snapMod.rollbackLibrary({ cfg: cfgG, home: gHome, restore: fakeRestore })
+  must(rb.ok === true && rb.rolledBack.length === 1, '回滚：按存档把缺的补回来，补完再比对一致')
+  must(snapMod.diffLibrary({ cfg: cfgG, home: gHome }).ok === true, '回滚后存档自动更新')
+
+  // 归档：过期的候选缓存 → 只留「当天选了哪些」
+  const oldRound = '2020-01-01-old'
+  const rd = picksMod.roundDir(cfgG, gHome, oldRound)
+  mkdirSync(join(rd, 'thumbs'), { recursive: true })
+  writeFileSync(join(rd, 'thumbs', '1.jpg'), 't')
+  picksMod.saveCandidates(cfgG, gHome, oldRound, {
+    schema: 2, round: oldRound, note: '', at: '2020-01-01T00:00:00.000Z',
+    items: [{ id: 1, kind: 'illust', title: '选中的', artist: 'a', status: 'saved' },
+      { id: 2, kind: 'illust', title: '没选的', artist: 'b', status: 'pending' }],
+  })
+  const oldPage = picksMod.pageFile(cfgG, gHome, oldRound)
+  writeFileSync(oldPage, '<html></html>')
+  const old = new Date('2020-01-01T00:00:00Z')
+  utimesSync(oldPage, old, old)
+  utimesSync(rd, old, old)
+  const ar = ret.archiveOldPicks({ cfg: cfgG, home: gHome })
+  must(ar.archived === 1 && !existsSync(rd), '过期候选缓存被清掉（缩略图一起删）')
+  const hist = JSON.parse(readFileSync(join(picksMod.picksRoot(cfgG, gHome), 'history', `${oldRound}.json`), 'utf8'))
+  must(hist.picked.length === 1 && hist.picked[0].id === 1 && hist.stagedCount === 2,
+    '归档后只留「当天选了哪些」：选中 1 件，候选总数仍记得')
+
+  // 删除记录过期：删掉记录就真的恢复不了
+  const days = (n) => new Date(Date.now() - n * 864e5).toISOString()
+  writeFileSync(join(gHome, 'library-manifest.jsonl'),
+    [
+      JSON.stringify({ id: 900, kind: 'illust', name: '9_很旧_900', tags: [], at: days(200) }),
+      JSON.stringify({ id: 901, kind: 'illust', name: '9_刚丢_901', tags: [], at: days(3) }),
+    ].join('\n') + '\n', 'utf8')
+  const dr = ret.expireDeleteRecords({ cfg: cfgG, home: gHome })
+  const rowsLeft = (await import('./lib/library.mjs')).readManifest(gHome)
+  must(dr.dropped === 1 && rowsLeft.length === 1 && rowsLeft[0].id === 901,
+    '删除记录过期：超过 90 天的清掉（再也恢复不了），3 天前的留着')
+} catch (e) { bad('快照守护检查失败', e) }
+
+/* ⑬ 推送模式：标签权重、关注门槛、必推线、关注列表缓存 */
+group('⑬ 推送模式：权重、关注门槛与缓存')
+try {
+  const { tagWeight, judgePush, normTag, readFollowing, writeFollowingForTest } = await import('./lib/following.mjs')
+  const pcfg = {
+    keywords: ['终末地', '白タイツ', 'ぱんつ', '触手', '東方', 'アズールレーン'],
+    dislikeTags: ['催眠'], dislikeWeight: -1, minPushWeight: 1, mustPushWeight: 5, followedOnly: true,
+  }
+  const w = tagWeight(pcfg, ['終末地', '白タイツ', '催眠', '無関係'])
+  must(w.weight === 1 && w.hit.length === 2, '权重：日文「終末地」也算命中「终末地」，不喜欢标签按 -1 扣')
+  must(normTag('終末地') === normTag('终末地') && normTag('絶区零') === normTag('绝区零'), '字形归一：終/绝 这种只差一个字的标签能对上')
+  must(judgePush({ cfg: { ...pcfg, followedOnly: false }, tags: [], authorId: 1, following: { ids: [] } }).ok, '推送模式关着时不拦任何作品')
+  must(judgePush({ cfg: pcfg, tags: ['白タイツ', 'ぱんつ'], authorId: 42, following: { ids: [42] } }).ok, '权重 ≥ 下限且作者被关注 ⇒ 可推')
+  must(judgePush({ cfg: pcfg, tags: ['白タイツ', 'ぱんつ'], authorId: 7, following: { ids: [42] } }).code === 'PUSH_MODE', '权重够、但作者没关注 ⇒ 拦下')
+  const mustP = judgePush({ cfg: pcfg, tags: ['白タイツ', 'ぱんつ', '終末地', '触手', '東方', 'アズールレーン'], authorId: 7, following: { ids: [] } })
+  must(mustP.ok && mustP.weight === 6, '权重和 > 必推线 ⇒ 必推（不看关注）')
+  must(judgePush({ cfg: pcfg, tags: ['催眠'], authorId: 42, following: { ids: [42] } }).code === 'PUSH_MODE', '只命中不喜欢标签 ⇒ 哪怕已关注也拦下')
+
+  const fHome = mkdtempSync(join(tmpdir(), 'px-follow-'))
+  let calls = 0
+  const fakePx = async () => {
+    calls += 1
+    if (calls === 1) return { ok: true, userId: 9, users: [{ id: 42 }, { id: 43 }] }
+    throw new Error('第二次应该命中缓存')
+  }
+  const f1 = await (await import('./lib/following.mjs')).getFollowing({ home: fHome, callPx: fakePx })
+  const f2 = await (await import('./lib/following.mjs')).getFollowing({ home: fHome, callPx: fakePx })
+  must(f1.total === 2 && f2.total === 2 && calls === 1, '关注列表缓存 12 小时：第二次不再打网络')
+  must(readFollowing(fHome).ids.length === 2, '关注列表落盘到 following.json')
+  const f3 = await (await import('./lib/following.mjs')).getFollowing({ home: fHome, callPx: async () => { throw new Error('网络断了') }, maxAgeMs: 0 })
+  must(f3.ok === false && f3.ids.length === 2, '网络失败时退回上一次的缓存，不把推送模式搞成空')
+} catch (e) { bad('推送模式检查失败', e) }
 
 /* 收尾：把 host 半端的定时器与 MCP 关掉 */
 try {
